@@ -1,0 +1,2 @@
+{"quantization_config": {"quant_method": "gptq", "bits": 4, "group_size": 128, "sym": true, "desc_act": false, "lm_head": false,
+  "dynamic": {"-:.*linear_attn\\.in_proj_[ab].*": {}, "-:(.*\\.)?fc$": {}, "-:.*visual.*": {}}}}
