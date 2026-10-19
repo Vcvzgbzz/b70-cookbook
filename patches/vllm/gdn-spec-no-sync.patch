@@ -1,0 +1,53 @@
+--- a/vllm/v1/attention/backends/gdn_attn.py
++++ b/vllm/v1/attention/backends/gdn_attn.py
+@@ -5,6 +5,8 @@
+ from dataclasses import dataclass, replace
+ from typing import Literal
+ 
++import os
++
+ import torch
+ 
+ from vllm.config import VllmConfig
+@@ -23,6 +25,9 @@
+ )
+ from vllm.v1.kv_cache_interface import MambaSpec
+ 
++# Default off: slice instead of host-mask gather on pure MTP-decode steps.
++_B70_GDN_NO_MASK_SYNC = os.environ.get("B70_GDN_NO_MASK_SYNC") == "1"
++
+ 
+ class GDNAttentionBackend(AttentionBackend):
+     @staticmethod
+@@ -354,9 +359,16 @@
+                     0, dtype=torch.int32, device=query_start_loc.device
+                 )
+                 # Filter by spec_sequence_masks to exclude padded sequences
+-                spec_state_indices_tensor = block_table_tensor[
+-                    spec_sequence_masks_cpu, : self.num_spec + 1
+-                ]
++                if _B70_GDN_NO_MASK_SYNC:
++                    # Padded rows trail the spec rows, so a slice equals the
++                    # mask gather without its blocking H2D index copy.
++                    spec_state_indices_tensor = block_table_tensor[
++                        :num_spec_decodes, : self.num_spec + 1
++                    ].contiguous()
++                else:
++                    spec_state_indices_tensor = block_table_tensor[
++                        spec_sequence_masks_cpu, : self.num_spec + 1
++                    ]
+                 non_spec_state_indices_tensor = None
+                 # Padded sequences are always at the back, so the first
+                 # num_spec_decodes + 1 entries of query_start_loc already
+@@ -413,7 +425,10 @@
+                 )
+ 
+             assert num_accepted_tokens is not None
+-            num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
++            if _B70_GDN_NO_MASK_SYNC and num_prefills == 0 and num_decodes == 0:
++                num_accepted_tokens = num_accepted_tokens[:num_spec_decodes]
++            else:
++                num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
+ 
+         chunk_indices: torch.Tensor | None = None
+         chunk_offsets: torch.Tensor | None = None

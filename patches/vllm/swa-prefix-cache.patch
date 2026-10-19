@@ -1,0 +1,116 @@
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index a097c9e924..106cb652ab 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -949,6 +949,11 @@ class RSWAManager(FullAttentionManager):
+ 
+ 
+ class SlidingWindowManager(SingleTypeKVCacheManager):
++    # B70_SWA_FINE_GRAINED: hash-block-granular hits (prompt-tail partial block + the window's full blocks).
++    supports_fine_grained_hash_lookup: ClassVar[bool] = (
++        __import__("os").environ.get("B70_SWA_FINE_GRAINED") == "1"
++    )
++
+     def __init__(self, kv_cache_spec: SlidingWindowSpec, **kwargs) -> None:
+         super().__init__(kv_cache_spec, **kwargs)
+         self.sliding_window = kv_cache_spec.sliding_window
+@@ -999,6 +1004,17 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
+             alignment_tokens=alignment_tokens,
+         )
+ 
++        block_size = kv_cache_spec.block_size
++        if (
++            cls.supports_fine_grained_hash_lookup
++            and alignment_tokens < block_size
++            and block_size % alignment_tokens == 0
++        ):
++            return cls._find_fine_grained_hit(
++                block_hashes, max_length, kv_cache_group_ids, block_pool,
++                kv_cache_spec, drop_eagle_block, alignment_tokens,
++            )
++
+         # The number of contiguous blocks needed for a prefix cache hit.
+         sliding_window_contiguous_blocks = cls._contiguous_blocks_for_hit(
+             kv_cache_spec.sliding_window, kv_cache_spec.block_size, drop_eagle_block
+@@ -1068,6 +1084,81 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
+         hit_length = len(computed_blocks[0]) * block_size
+         return computed_blocks, hit_length
+ 
++    @classmethod
++    def _find_fine_grained_hit(
++        cls,
++        block_hashes: BlockHashList,
++        max_length: int,
++        kv_cache_group_ids: list[int],
++        block_pool: BlockPool,
++        kv_cache_spec: SlidingWindowSpec,
++        drop_eagle_block: bool,
++        alignment_tokens: int,
++    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
++        """Longest hit at hash-block granularity: the block holding the hit end (a cached partial prompt tail or a
++        cached full block, whose prefix covers it) plus every full block in the attention window before it; earlier
++        blocks are null. With EAGLE the hit drops one hash unit and the window is checked for the reduced length."""
++        assert isinstance(block_hashes, Sequence)
++        block_size = kv_cache_spec.block_size
++        window = kv_cache_spec.sliding_window
++        full_hashes = BlockHashListWithBlockSize(block_hashes, alignment_tokens, block_size)
++        num_full = len(full_hashes)
++        drop = alignment_tokens if drop_eagle_block else 0
++        top = min(max_length // alignment_tokens, len(block_hashes))
++        for fine_idx in range(top - 1, -1, -1):
++            end = (fine_idx + 1) * alignment_tokens
++            hit = end - drop
++            if hit <= 0:
++                break
++            num_full_end, partial = divmod(end, block_size)
++            tail = None
++            if partial:
++                # Any block cached at this or a later boundary of the same block covers our prefix through `end`.
++                last_in_block = min((num_full_end + 1) * (block_size // alignment_tokens), len(block_hashes)) - 1
++                for k in range(fine_idx, last_in_block + 1):
++                    tail = block_pool.get_cached_block(block_hashes[k], kv_cache_group_ids)
++                    if tail:
++                        break
++                if not tail:
++                    continue
++            first = max(0, hit - window + 1) // block_size
++            window_blocks = []
++            for j in range(first, num_full_end):
++                cached = block_pool.get_cached_block(full_hashes[j], kv_cache_group_ids)
++                if not cached:
++                    break
++                window_blocks.append(cached)
++            if len(window_blocks) != num_full_end - first:
++                continue
++            computed: tuple[list[KVCacheBlock], ...] = tuple(
++                [block_pool.null_block] * first for _ in range(len(kv_cache_group_ids))
++            )
++            for cached in window_blocks + ([tail] if tail else []):
++                for out, blk in zip(computed, cached):
++                    out.append(blk)
++            num_blocks = cdiv(hit, block_size)
++            for out in computed:
++                del out[num_blocks:]
++            return computed, hit
++        return tuple([] for _ in range(len(kv_cache_group_ids))), 0
++
++    def cache_blocks(
++        self,
++        request: Request,
++        num_tokens: int,
++        retention_interval: int | None = None,
++        *,
++        replay_boundaries: Sequence[int],
++    ) -> None:
++        super().cache_blocks(
++            request,
++            num_tokens,
++            retention_interval=retention_interval,
++            replay_boundaries=replay_boundaries,
++        )
++        if self.supports_fine_grained_hash_lookup and self.block_size != self.block_pool.hash_block_size:
++            FullAttentionManager._cache_partial_tail_block(self, request, num_tokens)
++
+     @classmethod
+     def reachable_block_mask(
+         cls,

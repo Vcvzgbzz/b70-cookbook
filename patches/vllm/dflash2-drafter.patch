@@ -1,0 +1,179 @@
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index dbec9fd743..aa3f432252 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -1292,7 +1292,8 @@ class SpeculativeConfig:
+                     trust_remote_code=self.target_model_config.trust_remote_code,
+                     allowed_local_media_path=self.target_model_config.allowed_local_media_path,
+                     allowed_media_domains=self.target_model_config.allowed_media_domains,
+-                    dtype=self.target_model_config.dtype,
++                    dtype=__import__("os").environ.get("B70_DRAFT_DTYPE")
++                    or self.target_model_config.dtype,
+                     seed=self.target_model_config.seed,
+                     revision=self.revision,
+                     code_revision=self.code_revision,
+diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
+index 36a6c4c2c1..e212c88bcf 100644
+--- a/vllm/model_executor/models/qwen3_dflash.py
++++ b/vllm/model_executor/models/qwen3_dflash.py
+@@ -97,6 +97,18 @@ def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
+     return layer_types[layer_idx] == _SLIDING_ATTENTION
+ 
+ 
++def _b70_draft_dtype(
++    hidden_states: torch.Tensor, lm_head: nn.Module, processor: nn.Module
++) -> torch.Tensor:
++    """Cast drafter hidden states to a shared target lm_head's dtype (B70_DRAFT_DTYPE)."""
++    w = getattr(lm_head, "weight", None)
++    if isinstance(w, torch.Tensor) and w.dtype in (torch.float16, torch.bfloat16):
++        if w.dtype != hidden_states.dtype:
++            processor.head_dtype = w.dtype  # the head runs in the target dtype
++        return hidden_states.to(w.dtype)
++    return hidden_states
++
++
+ def dflash_has_any_non_causal(config: Qwen3Config) -> bool:
+     """Whether the draft needs a non-causal-capable backend, resolved from config
+     (config mirror of the model's ``get_draft_attn_causal``, usable pre-build)."""
+@@ -495,7 +507,7 @@ class DFlashQwen3Model(nn.Module):
+         )
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+-        embeds = self.embed_tokens(input_ids)
++        embeds = self.embed_tokens(input_ids).to(self.mask_embedding.dtype)  # shared target table may be fp16
+         if self.has_separate_mask_embedding and self.mask_token_id is not None:
+             # Replace masked slots with the dedicated mask embedding.
+             is_mask = (input_ids == self.mask_token_id).unsqueeze(-1)
+@@ -828,7 +840,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+         self,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor | None:
+-        logits = self.logits_processor(self.lm_head, hidden_states)
++        logits = self.logits_processor(self.lm_head, _b70_draft_dtype(hidden_states, self.lm_head, self.logits_processor))
+         if self.draft_id_to_target_id is None:
+             return logits
+ 
+@@ -861,6 +873,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+         needs_squeeze = hidden_states.dim() == 1
+         if needs_squeeze:
+             hidden_states = hidden_states.unsqueeze(0)
++        hidden_states = hidden_states.to(self.model.mask_embedding.dtype)  # target aux states may be fp16
+         expected = self.model.fc.input_size
+         if hidden_states.shape[-1] != expected:
+             raise ValueError(
+diff --git a/vllm/model_executor/models/qwen3_dflash2.py b/vllm/model_executor/models/qwen3_dflash2.py
+index 861a7c5412..be811b7d60 100644
+--- a/vllm/model_executor/models/qwen3_dflash2.py
++++ b/vllm/model_executor/models/qwen3_dflash2.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
++
+ import torch
+ import torch.nn.functional as F
+ from torch import nn
+@@ -397,6 +399,7 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+         super().__init__(vllm_config=vllm_config, prefix=prefix)
++        self.vllm_config = vllm_config  # build_draft_lmhead_int4 reads the TP size here
+         draft_config = self.config.dflash_config
+         softcap = float(draft_config.get("final_logit_softcapping") or 0.0)
+         self.candidate_logits_processor = LogitsProcessor(
+@@ -405,12 +408,53 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
+             soft_cap=softcap if softcap > 0 else None,
+         )
+ 
++    def load_weights(self, weights):
++        loaded = super().load_weights(weights)
++        from vllm.model_executor.models.b70_dflash_draft_int4 import quantize_dflash_drafter_int4
++
++        quantize_dflash_drafter_int4(self)
++        return loaded
++
+     def compute_candidates(
+         self, hidden_states: torch.Tensor
+     ) -> tuple[torch.Tensor, torch.Tensor]:
++        from vllm.model_executor.models.qwen3_dflash import _b70_draft_dtype
++
++        if os.environ.get("B70_DRAFT_LMHEAD_INT4") == "1":
++            from vllm.model_executor.models.b70_draft_lmhead_int4 import build_draft_lmhead_int4
++
++            if getattr(self, "_b70_lmhead_int4", None) is None:
++                build_draft_lmhead_int4(self)
++            if getattr(self, "_b70_lmhead_int4", None) is not None:
++                return self._b70_int4_candidates(hidden_states)
+         return self.candidate_logits_processor.get_top_k_tokens(
+-            self.lm_head, hidden_states, self.model.candidate_selector.top_k
++            self.lm_head, _b70_draft_dtype(
++                hidden_states, self.lm_head, self.candidate_logits_processor
++            ), self.model.candidate_selector.top_k
++        )
++
++    def _b70_int4_candidates(
++        self, hidden_states: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """get_top_k_tokens over the int4 draft head: top-k on the kept rows, mapped back to vocab ids."""
++        from vllm.model_executor.models.b70_draft_lmhead_int4 import int4_lmhead_logits
++
++        proc = self.candidate_logits_processor
++        qweight, scales, qzeros, group_size = self._b70_lmhead_int4
++        logits = int4_lmhead_logits(
++            hidden_states.to(scales.dtype), qweight, scales, qzeros, group_size
+         )
++        trim = getattr(self, "_b70_lmhead_idx", None)
++        if trim is None:
++            logits = logits[..., : proc.org_vocab_size]
++        values, ids = torch.topk(logits, self.model.candidate_selector.top_k, dim=-1)
++        ids = trim[0][ids] if trim is not None else ids.to(torch.int64)
++        values = values.float()
++        if proc.scale != 1.0:
++            values = values * proc.scale
++        if proc.soft_cap is not None:
++            values = torch.tanh(values / proc.soft_cap) * proc.soft_cap
++        return ids, values
+ 
+ 
+ EntryClass = DFlash2Qwen3ForCausalLM
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/utils.py b/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
+index d32587d266..775f2bc298 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
+@@ -1,5 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import copy
++
+ import torch.nn as nn
+ 
+ from vllm.config import VllmConfig, replace
+@@ -24,8 +26,14 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+     draft_model_config = speculative_config.draft_model_config
+     # Select an attention backend that supports the drafter's attention: mixing
+     # a non-causal layer onto a causal-only backend would fail.
++    # B70_DRAFT_DTYPE: the drafter builds its params, buffers and KV in its own dtype
++    model_config = vllm_config.model_config
++    if draft_model_config.dtype != model_config.dtype:
++        model_config = copy.copy(model_config)
++        object.__setattr__(model_config, "dtype", draft_model_config.dtype)
+     draft_vllm_config = replace(
+         vllm_config,
++        model_config=model_config,
+         attention_config=replace(
+             vllm_config.attention_config,
+             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
+diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
+index b72786ed79..bf91ed461d 100644
+--- a/vllm/v1/worker/gpu/spec_decode/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
+@@ -131,7 +131,7 @@ class DraftModelSpeculator(BaseSpeculator):
+             hc_mult = getattr(self.draft_model_config.hf_config, "hc_mult", 1)
+             self.hidden_size = self.hidden_size * hc_mult
+         self.vocab_size = self.draft_model_config.get_vocab_size()
+-        self.dtype = vllm_config.model_config.dtype
++        self.dtype = self.draft_model_config.dtype  # B70_DRAFT_DTYPE: drafter-side buffers
+         self.use_fp64_gumbel = vllm_config.model_config.use_fp64_gumbel
+         self.use_local_argmax_reduction = (
+             self.speculative_config.use_local_argmax_reduction

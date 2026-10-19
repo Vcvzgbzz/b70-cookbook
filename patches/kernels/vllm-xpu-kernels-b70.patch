@@ -1,0 +1,193 @@
+diff --git a/csrc/xpu/attn/xe_2/collective/chunk_prefill_epilogue.hpp b/csrc/xpu/attn/xe_2/collective/chunk_prefill_epilogue.hpp
+index 210e301..9a48c2b 100644
+--- a/csrc/xpu/attn/xe_2/collective/chunk_prefill_epilogue.hpp
++++ b/csrc/xpu/attn/xe_2/collective/chunk_prefill_epilogue.hpp
+@@ -581,6 +581,10 @@ class DecodeFwdEpilogue {
+       ElementLSE row_lse = static_cast<ElementLSE>(
+           static_cast<float>(rA_max(0)) * kLn2 +
+           sycl::log(static_cast<float>(stats_sum)));
++#if defined(B70_SPEC_ROW_MASK)
++      // Every key of this split masked for the row: zero weight in ReduceSplitK instead of NaN.
++      if (!(stats_sum > ElementA(0))) row_lse = static_cast<ElementLSE>(-1e30f);
++#endif
+       if (num_kv_splits > 1) {
+         softmax_lse_accum(q_row, idx_kv_split) = row_lse;
+       }
+@@ -600,7 +604,11 @@ class DecodeFwdEpilogue {
+     // FlashAttention's split-K contract.
+     CUTLASS_PRAGMA_UNROLL
+     for (int i = 0; i < rA_sum.size(); i++) {
++#if defined(B70_SPEC_ROW_MASK)
++      rA_sum(i) = rA_sum(i) > ElementA(0) ? ElementA(1) / rA_sum(i) : ElementA(0);
++#else
+       rA_sum(i) = ElementA(1) / rA_sum(i);
++#endif
+     }
+ 
+     CUTLASS_PRAGMA_UNROLL
+diff --git a/csrc/xpu/attn/xe_2/collective/chunk_prefill_mainloop.hpp b/csrc/xpu/attn/xe_2/collective/chunk_prefill_mainloop.hpp
+index 1f4557b..6a326ff 100644
+--- a/csrc/xpu/attn/xe_2/collective/chunk_prefill_mainloop.hpp
++++ b/csrc/xpu/attn/xe_2/collective/chunk_prefill_mainloop.hpp
+@@ -496,7 +496,24 @@ struct FMHAFwdMainloop<
+       const float scale_k = *static_cast<const float*>(params.scale_k);
+       scale_v = *static_cast<const float*>(params.scale_v);
+       effective_scale = params.scale * ElementS(scale_k);
++#if defined(B70_E4M3_FAST)
++      // The fast e4m3 -> half reorder returns value / 256.
++      if constexpr (std::is_same_v<ElementK, float_e4m3_t> &&
++                    std::is_same_v<typename TiledMMAQK::ValTypeB, half_t>) {
++        effective_scale = effective_scale * ElementS(256.f);
++      }
++      if constexpr (std::is_same_v<ElementK, float_e4m3_t> &&
++                    std::is_same_v<typename TiledMMAPV::ValTypeB, half_t>) {
++        scale_v *= 256.f;
++      }
++#endif
++    }
++#if defined(B70_E4M3_FAST)
++    if constexpr (std::is_same_v<ElementQ, float_e4m3_t> &&
++                  std::is_same_v<typename TiledMMAQK::ValTypeA, half_t>) {
++      effective_scale = effective_scale * ElementS(256.f);
+     }
++#endif
+ 
+     [[maybe_unused]] auto route_current = [&](int cur) -> int {
+       int k_surf = PagedKV ? cur / tiles_per_surface : 0;
+@@ -873,6 +890,9 @@ struct DecodeFwdMainloop<
+     int window_size_right;
+     // Physical stride between paged blocks in seq-position units
+     int page_stride_elements;
++    // B70_SPEC_ROW_MASK: packed verify rows; row r sees seq_len - (spec_qlen - 1 - r / spec_g) keys
++    int spec_qlen = 1;
++    int spec_g = 1;
+   };
+ 
+   // Kernel-facing parameters
+@@ -903,7 +923,9 @@ struct DecodeFwdMainloop<
+         args.total_seqlen_kv,
+         args.window_size_left,
+         args.window_size_right,
+-        args.page_stride_elements};
++        args.page_stride_elements,
++        args.spec_qlen,
++        args.spec_g};
+   }
+ 
+   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
+@@ -1200,7 +1222,24 @@ struct DecodeFwdMainloop<
+       const float scale_k = *static_cast<const float*>(params.scale_k);
+       scale_v = *static_cast<const float*>(params.scale_v);
+       effective_scale = params.scale * ElementS(scale_k);
++#if defined(B70_E4M3_FAST)
++      // The fast e4m3 -> half reorder returns value / 256.
++      if constexpr (std::is_same_v<ElementK, float_e4m3_t> &&
++                    std::is_same_v<typename TiledMMAQK::ValTypeB, half_t>) {
++        effective_scale = effective_scale * ElementS(256.f);
++      }
++      if constexpr (std::is_same_v<ElementK, float_e4m3_t> &&
++                    std::is_same_v<typename TiledMMAPV::ValTypeB, half_t>) {
++        scale_v *= 256.f;
++      }
++#endif
++    }
++#if defined(B70_E4M3_FAST)
++    if constexpr (std::is_same_v<ElementQ, float_e4m3_t> &&
++                  std::is_same_v<typename TiledMMAQK::ValTypeA, half_t>) {
++      effective_scale = effective_scale * ElementS(256.f);
+     }
++#endif
+ 
+     /* Main loop, blocked in k. */
+     int next_tile_idx;
+@@ -1269,6 +1308,26 @@ struct DecodeFwdMainloop<
+         }
+       }
+ 
++#if defined(B70_SPEC_ROW_MASK)
++      /* Packed MTP verify: per-row causal limit over the newest spec_qlen - 1 keys */
++      if (params.spec_qlen > 1 &&
++          (K + 1) * get<1>(TileShapeQK{}) > seq_len - (params.spec_qlen - 1)) {
++        Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
++        Tensor gP = local_tile(
++            cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
++        auto cS_thread = thr_mma_qk.partition_C(gP);
++        CUTLASS_PRAGMA_UNROLL
++        for (int i = 0; i < tSrS.size(); ++i) {
++          int row_idx = get<0>(cS_thread(i));
++          int col_idx = get<1>(cS_thread(i));
++          int lag = params.spec_qlen - 1 - row_idx / params.spec_g;
++          if (lag > 0 && col_idx >= seq_len - lag) {
++            tSrS(i) = ElementS(-INFINITY);
++          }
++        }
++      }
++#endif
++
+       /* k masking for remainder tiles */
+       if (check_remainder_k && K == blk_k1 - 1) {
+         FragSCol k_rem_mask;
+diff --git a/csrc/xpu/attn/xe_2/paged_decode.hpp b/csrc/xpu/attn/xe_2/paged_decode.hpp
+index e5d9ad1..efbe104 100644
+--- a/csrc/xpu/attn/xe_2/paged_decode.hpp
++++ b/csrc/xpu/attn/xe_2/paged_decode.hpp
+@@ -163,6 +163,9 @@ struct paged_decode_args_t {
+   // pass), otherwise by the ReduceSplitK kernel.
+   float* softmax_lse = nullptr;
+   int lse_stride = 0;  // stride along the head dim (= total_seqlen_q)
++  // B70_SPEC_ROW_MASK: packed MTP verify rows (draft positions x GQA heads); 1 = plain decode
++  int spec_qlen = 1;
++  int spec_g = 1;
+ };
+ 
+ template <class FMHAKernel, class ReductionSplitKernel, bool isVarLen>
+@@ -351,7 +354,9 @@ struct DecodeKernelLauncher {
+          args.window_size_right,
+          // page_stride_elements: physical stride between paged blocks in
+          // seq-position units. It includes interleaved and cross-layer gaps.
+-         args.page_stride_elements},
++         args.page_stride_elements,
++         args.spec_qlen,
++         args.spec_g},
+         {},
+         hw_info,
+         args.num_kv_splits};
+diff --git a/csrc/xpu/attn/xe_2/paged_decode_xe2.cpp b/csrc/xpu/attn/xe_2/paged_decode_xe2.cpp
+index b44f4f8..99a098c 100644
+--- a/csrc/xpu/attn/xe_2/paged_decode_xe2.cpp
++++ b/csrc/xpu/attn/xe_2/paged_decode_xe2.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include "paged_decode_xe2.h"
+ #include "paged_decode_utils.hpp"
+ // Use the generated extern header (only declares enabled policies)
+@@ -304,6 +305,16 @@ void cutlass_paged_decode_impl(
+     if (head_size <= HEAD_SIZE_LIMIT_6) return 6;
+     return -1;
+   };
++#if defined(B70_SPEC_ROW_MASK)
++  if (const char* q = std::getenv("B70_SPEC_QLEN")) {
++    const int ql = std::atoi(q);
++    const int group = num_heads_q / num_heads_kv;
++    if (ql > 1 && group % ql == 0) {
++      args.spec_qlen = ql;
++      args.spec_g = group / ql;
++    }
++  }
++#endif
+ 
+   int head_case = get_head_size_case(args.head_size);
+   int num_q_group_size = num_heads_q / num_heads_kv;
+@@ -313,7 +324,12 @@ void cutlass_paged_decode_impl(
+   // a packed-Q tile size rather than a hard cap on the GQA ratio. Ratios <= 8
+   // fit a single _8 tile; larger ratios (e.g. falcon-7b's 71 query heads / 1 KV
+   // head) are processed by ceil(ratio / qgroup) work-groups using the _16 tile.
++#if defined(B70_DECODE_Q8_HEAD256)
++  // head 256: the _16 tile spills, so large packed groups use ceil(ratio / 8) _8 work-groups instead.
++  if (num_q_group_size <= 8 || args.head_size == 256) {
++#else
+   if (num_q_group_size <= 8) {
++#endif
+     dispatch_by_page_size<_8>(block_size, head_case, queue, cuQKType, args);
+   } else {
+     dispatch_by_page_size<_16>(block_size, head_case, queue, cuQKType, args);

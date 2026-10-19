@@ -1,0 +1,39 @@
+diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+index ac27296461..c4f5a61259 100644
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -41,6 +41,8 @@ from vllm.model_executor.layers.fused_moe.utils import (
+ )
+ from vllm.model_executor.layers.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
++from vllm.model_executor.models.b70_target_lmhead_fp8 import use_fp8_target_lmhead
++from vllm.model_executor.models.b70_embed_uva import offload_embed_tokens
+ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+     QwenGatedDeltaNetAttention,
+ )
+@@ -429,12 +431,14 @@ class Qwen3_5ForCausalLMBase(
+         self,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor | None:
++        use_fp8_target_lmhead(self)
+         return self.logits_processor(self.lm_head, hidden_states)
+ 
+     def compute_logits_local(
+         self,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor:
++        use_fp8_target_lmhead(self)
+         return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+@@ -604,7 +608,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(self)
+-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
++        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
++        offload_embed_tokens(self.language_model.model)
++        return loaded
+ 
+     @classmethod
+     def get_mamba_state_dtype_from_config(

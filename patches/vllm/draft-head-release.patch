@@ -1,0 +1,14 @@
+--- a/vllm/model_executor/models/b70_draft_lmhead_int4.py
++++ b/vllm/model_executor/models/b70_draft_lmhead_int4.py
+@@ -121,6 +121,11 @@
+     print(f"[B70] draft LM head INT4: listo. {fp16_bytes/1e9:.2f} GB fp16 -> "
+           f"{int4_bytes/1e9:.2f} GB INT4 (ahorro "
+           f"{(fp16_bytes - int4_bytes)/1e6:.1f} MB/lectura)", flush=True)
++    if os.environ.get("B70_TARGET_LMHEAD_FP8") == "1":
++        from vllm.model_executor.models.b70_target_lmhead_fp8 import release_fp16_head_if_unused
++
++        head._b70_int4_built = True
++        release_fp16_head_if_unused(head)
+ 
+ 
+ def draft_lmhead_int4_logits(model, hidden_states: torch.Tensor) -> torch.Tensor:
